@@ -152,7 +152,7 @@ healthcheck" and "I configured one badly" stay visibly different states.
 
 ## Boundaries
 
-**vs. k3s** -- k3s is the default for services on this fleet. nixpods is for workloads that are
+**vs. k3s** -- k3s is the default for services here. nixpods is for workloads that are
 single-host **by nature** -- something with real local state, a hardware dependency, or an
 identity tied to one specific machine -- not merely for something that happens to be small today.
 "It's small" is not a reason to reach for nixpods; "it cannot be anything but this one host" is.
@@ -233,7 +233,7 @@ outside the Nix build sandbox (which has no writable `/run` for it to use) -- se
 check` itself, and `checks/default.nix`'s own comment says why. Not yet done, deliberately:
 `.build`/`.image`/`.kube`/`.artifact` Quadlet kinds (see `experiments/README.md`'s open question
 003 for why, and the most likely next one to actually earn its own module). Nothing here has yet
-run a real workload on a live fleet host; that is the next step, not this one.
+run a real workload on a live host; that is the next step, not this one.
 
 ## License
 

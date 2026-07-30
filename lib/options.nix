@@ -37,7 +37,7 @@ rec {
   # everything rootless podman needs to actually start at boot:
   #   - the target uid's systemd `--user` instance has to exist unprompted, which needs
   #     `users.users.<name>.linger = true` (this repo does not set it -- see the assertion below,
-  #     and the fleet's own user/uid management is out of this repo's scope, same boundary nixvm
+  #     and the operator's own user/uid management is out of this repo's scope, same boundary nixvm
   #     draws around bridges it never creates);
   #   - that uid needs a subuid/subgid range for user-namespaced containers (`--user` podman's
   #     own concern, not nixpods');
