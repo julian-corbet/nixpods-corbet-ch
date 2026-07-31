@@ -60,8 +60,8 @@ let
   # `systemd.user.services.<name>` both already imply the suffix themselves (NixOS appends it
   # when generating the real unit file); the on-disk file lib/build.nix looks for IS
   # "${obj.serviceName}.service" (see its own `services = map (obj: "${obj.serviceName}.service")
-  # objects` line), but that is a filename, not this attribute name, and the two must not be
-  # confused the way an early draft of this file did.
+  # objects` line), but that is a filename, not this attribute name -- the two must not be
+  # confused.
   mkOverride = obj: lib.nameValuePair obj.serviceName {
     overrideStrategy = "asDropin";
     wantedBy = obj.wantedBy;
