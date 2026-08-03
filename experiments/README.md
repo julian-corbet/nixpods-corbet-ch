@@ -35,7 +35,7 @@ reasoned rather than measured.
 
 ## 002 -- should `rootless.uid` also validate against `users.users.*` more strictly?
 
-**Question:** `modules/default.nix`'s linger check is a `warnings` entry, not an `assertions`
+**Question:** `modules/nixos.nix`'s linger check is a `warnings` entry, not an `assertions`
 failure -- see its own comment for why (lingering can legitimately be managed imperatively,
 outside this Nix config, via `loginctl enable-linger`, which nixpods cannot observe).
 

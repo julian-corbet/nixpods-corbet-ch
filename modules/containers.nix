@@ -2,7 +2,7 @@
 #
 # `nixpods.containers.<name>` -- the main policy-bearing surface of this repo. Every option here
 # renders to a real Quadlet `[Container]`/`[Unit]`/`[Service]` key via lib/render.nix; nothing in
-# this file talks to podman, systemd, or the generator directly -- see modules/default.nix for
+# this file talks to podman, systemd, or the generator directly -- see modules/nixpods.nix for
 # where the rendered text actually becomes a package and gets installed.
 { lib, config, ... }:
 
@@ -21,62 +21,9 @@ let
       };
 
       # ── image pinning: see the repo README's "image pinning" section for the full case ────
-      image = lib.mkOption {
-        description = "Which image this container runs, and how it is pinned -- see the submodule's own option docs.";
-        type = lib.types.submodule {
-          options = {
-            repository = lib.mkOption {
-              type = lib.types.str;
-              example = "docker.io/library/nginx";
-              description = ''
-                THE QUESTION: which image repository does this container run? NO DEFAULT --
-                guessing a repository here would be exactly the kind of silent drift-by-typo
-                this repo exists to catch, not commit.
-              '';
-            };
-            tag = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = null;
-              example = "1.27.3";
-              description = ''
-                A human-readable tag, kept purely for changelog/diff legibility and for tools
-                (Renovate and similar) that track upstream releases by tag. NEVER authoritative
-                on its own -- `digest` below is what actually resolves the pull; a tag with no
-                digest is exactly the floating reference this repo exists to catch (see
-                `allowFloatingTag`).
-              '';
-            };
-            digest = lib.mkOption {
-              type = lib.types.nullOr (lib.types.strMatching "sha256:[0-9a-f]{64}");
-              default = null;
-              example = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-              description = ''
-                THE QUESTION THIS OPTION ANSWERS: which exact bytes does this container run,
-                regardless of what the registry serves under `tag` tomorrow? This is the reason
-                nixpods exists at all -- without a digest, Podman (and Quadlet's own
-                `AutoUpdate=`) resolve `tag` at PULL time, so the exact image running on a host
-                is whatever the registry currently happens to serve under that name: drift that
-                is, from this Nix config's own perspective, indistinguishable from "nothing
-                changed". NO DEFAULT. See `allowFloatingTag` for the one deliberate opt-out, and
-                this module's own assertion (below) for what happens if neither is set.
-              '';
-            };
-            allowFloatingTag = lib.mkOption {
-              type = lib.types.bool;
-              default = false;
-              description = ''
-                Explicit acknowledgement: run this container from `tag` alone, with no digest,
-                accepting that the registry can move the bits under this host with no
-                corresponding change to this Nix config. Default `false` on purpose -- THE POINT
-                of nixpods is that a container's image does not move unless a commit says so.
-                Setting this `true` is reported in `warnings` by container name every build, so a
-                host that took this shortcut is never quietly indistinguishable from one that
-                pinned properly.
-              '';
-            };
-          };
-        };
-      };
+      # The submodule itself lives in lib/options.nix so that appliance modules in this repo
+      # cannot grow a second, laxer one that this file's digest assertion never sees.
+      image = opts.imageOption { };
 
       # ── root vs rootless: see lib/options.nix's rootlessOption for the full reasoning ──────
       rootless.uid = opts.rootlessOption;
@@ -147,6 +94,21 @@ let
         description = "Raw `SRC:DEST[:OPTIONS]` bind/volume specs (Quadlet `Volume=`, repeatable).";
       };
 
+      devices = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "/dev/sr0:/dev/sr0" ];
+        description = ''
+          Host device nodes passed into the container as `HOST[:CONTAINER][:PERMISSIONS]`
+          (Quadlet `AddDevice=`, repeatable, rendered by the generator as `--device`).
+
+          Typed rather than left to `extraContainerConfig` because a hardware dependency is one
+          of the two things that make a workload single-host BY NATURE -- which is this repo's
+          own stated reason to exist next to k3s (see the README's "Boundaries"). The option a
+          hardware-bound container needs most should not be the escape hatch.
+        '';
+      };
+
       ports = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -213,7 +175,29 @@ let
         default = { };
       };
 
+      oneshot = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Whether this container is a job that RUNS TO COMPLETION rather than a service that
+          stays up (`Type=oneshot` in the generated unit instead of quadlet's default
+          `Type=notify`).
+
+          This changes the ExecStart the generator writes, not just a label: for `oneshot` it
+          omits `-d` and `--sdnotify=conmon`, so podman runs in the foreground under systemd,
+          `systemctl start <name>` blocks until the job is done, and the unit's result carries
+          the job's own exit status. Left `false`, the container is started detached and the
+          unit stays active for as long as the container runs.
+
+          Pair this with `wantedBy = [ ]` for a job the operator triggers by hand, and with
+          `restartIfChanged = false` so a deploy that changes an unrelated option does not
+          count as a trigger.
+        '';
+      };
+
       restart = opts.restartOption;
+
+      restartIfChanged = opts.restartIfChangedOption;
 
       wantedBy = opts.wantedByOption [ "multi-user.target" ];
 
@@ -221,7 +205,7 @@ let
       extraContainerConfig = opts.extraSectionOption "Escape hatch into this unit's [Container] section for keys not modeled above.";
       extraServiceConfig = opts.extraSectionOption "Escape hatch into this unit's [Service] section for keys not modeled above.";
 
-      # ── computed, read-only -- consumed by modules/default.nix ─────────────────────────────
+      # ── computed, read-only -- consumed by modules/nixpods.nix ──────────────────────────────
       ref = lib.mkOption { type = lib.types.str; readOnly = true; internal = true; description = "The Quadlet source filename this container renders to."; };
       serviceName = lib.mkOption { type = lib.types.str; readOnly = true; internal = true; description = "The systemd service name (without .service) the generator is expected to produce."; };
       text = lib.mkOption { type = lib.types.str; readOnly = true; internal = true; description = "The rendered .container INI text."; };
@@ -260,6 +244,20 @@ in
             (nixpods.containers.${n}.image.digest = "sha256:...") or, if this container
             genuinely must float, set nixpods.containers.${n}.image.allowFloatingTag = true and
             accept the warning that comes with it.
+          '';
+        }
+        {
+          assertion = !c.enable || !c.oneshot || lib.elem c.restart.policy opts.oneshotRestartPolicies;
+          message = ''
+            nixpods.containers.${n} is oneshot = true with restart.policy = "${c.restart.policy}".
+            systemd REFUSES TO LOAD a Type=oneshot unit whose Restart= is "always" or
+            "on-success" ("Service has Restart= set to either always or on-success, which isn't
+            allowed for Type=oneshot services. Refusing.") -- and it refuses at unit-load time on
+            the host, long after any build has succeeded, which is exactly the discovery this
+            repo exists to move earlier. Use one of:
+            ${lib.concatStringsSep ", " opts.oneshotRestartPolicies}. For a job an operator
+            triggers by hand, "no" is almost always the honest answer -- a rerun is a decision,
+            not a retry.
           '';
         }
         {

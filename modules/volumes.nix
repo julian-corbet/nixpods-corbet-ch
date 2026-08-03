@@ -21,6 +21,8 @@ let
 
       rootless.uid = opts.rootlessOption;
 
+      restartIfChanged = opts.restartIfChangedOption;
+
       wantedBy = opts.wantedByOption [ ];
 
       extraUnitConfig = opts.extraSectionOption "Escape hatch into this unit's [Unit] section for keys not modeled above.";

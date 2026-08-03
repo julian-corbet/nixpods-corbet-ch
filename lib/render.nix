@@ -103,6 +103,7 @@ rec {
           { key = "Network"; value = cfg.network; }
           { key = "Environment"; value = lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment; }
           { key = "Volume"; value = cfg.volumes; }
+          { key = "AddDevice"; value = cfg.devices; }
           { key = "PublishPort"; value = cfg.ports; }
           { key = "HealthCmd"; value = cfg.health.cmd; }
           { key = "HealthInterval"; value = if cfg.health.cmd != null then cfg.health.interval else null; }
@@ -114,6 +115,16 @@ rec {
       {
         name = "Service";
         entries = [
+          # `Type=` is the ONE [Service] key quadlet itself validates rather than copying
+          # through: it accepts `notify` (its own default, which it then implements with
+          # `-d --sdnotify=conmon`) and `oneshot`, and rejects anything else by name at
+          # generation time. `oneshot` is not a cosmetic relabelling -- the generator drops
+          # `-d` and `--sdnotify=conmon` from the ExecStart it writes, so the container runs
+          # in the FOREGROUND under systemd and the unit completes when the work does. That is
+          # the difference between `systemctl start` returning immediately and `systemctl
+          # start` returning the job's own exit status. Left unset (null) for a normal
+          # long-running container, so quadlet's own default stands unmentioned.
+          { key = "Type"; value = if cfg.oneshot then "oneshot" else null; }
           { key = "Restart"; value = cfg.restart.policy; }
           { key = "RestartSec"; value = cfg.restart.restartSec; }
         ] ++ extraEntries cfg.extraServiceConfig;

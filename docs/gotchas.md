@@ -104,7 +104,7 @@ It is also why rootless still needs care nixpods cannot supply on its own: the t
 `--user` manager instance has to exist before anything can start in it, which needs
 `users.users.<name>.linger = true` -- a real NixOS option (`nixos/modules/config/users-groups.nix`),
 gated behind `users.manageLingering`. nixpods asserts nothing here beyond a by-name warning (see
-`modules/default.nix`) because user/uid management is out of this repo's scope, the same boundary
+`modules/nixos.nix`) because user/uid management is out of this repo's scope, the same boundary
 `nixvm` draws around bridges it never creates.
 
 ## The rootless network-online wait is a live, open nixpkgs footgun
@@ -116,3 +116,122 @@ observed adding 60+ seconds to every rootless container start. `nixpods.containe
 waitForNetworkOnline = false` renders `DefaultDependencies=false` in the generated unit's own
 `[Quadlet]` section (a real section, distinct from the same-named `[Unit]` key systemd itself
 defines) to opt a specific container out of this dependency entirely.
+
+
+## `systemd.packages` means the same thing on system-manager -- which is why one declaration serves both planes
+
+Read out of `numtide/system-manager`'s own `nix/modules/systemd.nix`, not assumed by analogy with
+NixOS. Its `/etc/systemd/system` builder is literally:
+
+```
+for package in $packages
+do
+  for hook in $package/lib/systemd/system/*
+  do
+    ln -s $hook $out/
+  done
+done
+```
+
+followed by the same collision rule NixOS's `overrideStrategy = "asDropin"` produces -- if a unit
+of that name already came from a package, the Nix-side definition is installed as
+`$out/<unit>.d/overrides.conf` rather than replacing it. `systemd.tmpfiles.rules` is there too,
+with NixOS's own syntax. So a package of generated `.service` files, plus a drop-in carrying
+`wantedBy`, installs identically on both planes; nothing in nixpods' mechanism needed a per-plane
+translation table.
+
+Two things genuinely do NOT cross:
+
+- **There is no `systemd/user` tree.** That etc builder emits `systemd/system` and nothing else,
+  so a rootless object would be generated correctly and installed nowhere. `modules/system-manager.nix`
+  refuses it by name instead.
+- **`virtualisation.*` does not exist.** Podman on a foreign distro is the distro's package, which
+  is what `nixpods.podman.path` and the pre-activation assertion around it are for.
+
+## The generated `ExecStart=` binary is redirectable with one environment variable
+
+The generator names the podman that ran it, by absolute store path. It also reads `PODMAN`:
+
+```
+$ QUADLET_UNIT_DIRS=./in podman-system-generator ./out1
+ExecStart=/nix/store/...-podman-5.8.4/bin/podman run --name systemd-%N ...
+
+$ QUADLET_UNIT_DIRS=./in PODMAN=/usr/bin/podman podman-system-generator ./out2
+ExecStart=/usr/bin/podman run --name systemd-%N ...
+```
+
+Byte-identical output apart from the three `Exec*=` lines (`ExecStart`, `ExecStop`,
+`ExecStopPost`). This is what lets a foreign-distro host generate its units from a nix-built
+podman at build time and still run the distro's own podman at run time, instead of carrying a
+second copy of the CLI over one shared `/var/lib/containers`. The FLAGS in that ExecStart are
+still the generating podman's vocabulary, so the two want to stay on the same major version.
+
+## `Type=oneshot` is a real translation change, not a relabelling -- and `Type=` is the one `[Service]` key quadlet validates
+
+Quadlet copies unknown `[Service]` keys through verbatim (`X-RestartIfChanged=false` lands in the
+generated unit untouched), but it reads `Type=` itself:
+
+| `[Service] Type=` in the `.container` | generator | result |
+|---|---|---|
+| absent | exit `0` | `Type=notify`, `NotifyAccess=all`, ExecStart gains `--sdnotify=conmon -d` |
+| `oneshot` | exit `0` | `Type=oneshot`, no notify keys, ExecStart has **no** `-d` and no `--sdnotify` |
+| `simple` | exit `1`, no unit | `invalid service Type 'simple'` |
+
+So `oneshot` is what makes `systemctl start <name>` block until the container is done and report
+its exit status, rather than returning as soon as conmon says the container is up. For a job
+someone starts by hand -- rip this disc -- that difference is the whole interface.
+
+`Privileged=` is NOT a `[Container]` key, in either shape:
+
+```
+$ QUADLET_UNIT_DIRS=./in4 podman-system-generator ./out4
+quadlet-generator: converting "priv.container": unsupported key 'Privileged' in group 'Container'
+exit=1
+```
+
+`PodmanArgs=--privileged` is the supported route, and lands verbatim in the ExecStart.
+
+## systemd's `Restart=` is not Podman's, and it does not tell you when you get that wrong
+
+`unless-stopped` is a real Docker/Podman restart policy and not a systemd one. systemd does not
+refuse it -- it *ignores* it:
+
+```
+$ systemd-analyze verify a-unless-stopped.service
+a-unless-stopped.service:6: Failed to parse Restart=unless-stopped, ignoring: Invalid argument
+```
+
+The unit loads, with `Restart=no`. A service asking to be kept alive quietly never is. `nixpods`'
+`restart.policy` enum therefore carries systemd's seven values and not Podman's vocabulary; since
+quadlet passes `[Service]` keys through unvalidated, the Nix type is the only place that check
+can happen at all.
+
+`Type=oneshot` narrows the same list further. All seven, against `systemd-analyze verify`
+(systemd 261):
+
+| `Restart=` with `Type=oneshot` | result |
+|---|---|
+| `no`, `on-failure`, `on-abnormal`, `on-abort`, `on-watchdog` | clean |
+| `always`, `on-success` | `Service has Restart= set to either always or on-success, which isn't allowed for Type=oneshot services. Refusing.` |
+
+"Refusing" means the unit does not load at all -- discovered on the host, at start time, with a
+build that succeeded. `modules/containers.nix` asserts against the accepted list instead.
+
+## A deploy can start an on-demand unit, unless the unit says otherwise
+
+system-manager's activator (`crates/system-manager-engine/src/activate/services.rs`) collects
+every unit whose store path changed and calls `ReloadOrRestartUnit` on it. It does not first ask
+whether the unit is running, and systemd's `reload-or-restart` job type STARTS an inactive unit.
+For an on-demand unit -- `wantedBy = [ ]`, started by hand when the hardware is actually there --
+that turns "I changed an unrelated option and redeployed" into "the job ran".
+
+The escape is the same key on both planes, and both activators read it out of the `[Service]`
+section specifically:
+
+- system-manager: `parse_systemd_bool(unit_info.as_ref(), "Service", "X-RestartIfChanged", true)`
+- NixOS's switch-to-configuration-ng: `parse_systemd_bool(new_unit_info, "Service", "X-RestartIfChanged", true)`,
+  and its `parse_unit` merges `<unit>.d/*.conf` drop-ins before looking
+
+nixpkgs' own `serviceToUnit` emits `X-RestartIfChanged=false` into `[Service]` when
+`restartIfChanged = false` -- so setting it on the drop-in nixpods already installs for
+`wantedBy` covers both. `nixpods.containers.<name>.restartIfChanged` is that option.

@@ -8,17 +8,21 @@
 #
 #   2. Everything under `results` below -- EVAL-TIME tests through real `nixosSystem`
 #      composition (mirrors nixvm/nixboot's own checks/default.nix): does a host importing
-#      `modules/default.nix` evaluate at all, and -- the failing direction, proven as
+#      `modules/nixos.nix` evaluate at all, and -- the failing direction, proven as
 #      deliberately as the passing one -- does an unpinned image, a dangling `Pod=` reference, or
 #      a container/pod name collision each fail evaluation BY NAME rather than silently produce
 #      something half-formed.
 #
-#   3. `quadlet-generates-real-units` -- the one check in this repo that is an ACTUAL BUILD, not
-#      an eval-time assertion: it runs lib/build.nix's `mkQuadletUnitPackage` against a
-#      well-formed rendered container for real, then greps the generated `.service` for the
-#      exact lines that prove the mechanism (a real `ExecStart=.../podman run`, `Type=notify`,
-#      `NotifyAccess=all`, the `Pod=` reference resolved to a literal `BindsTo=`, the healthcheck
-#      flag, the pod's reverse `Wants=`). This derivation's own comment explains why it does NOT
+#   3. `quadlet-generates-real-units` and `quadlet-honours-foreign-podman-path` -- the checks in
+#      this file that are ACTUAL BUILDS, not eval-time assertions: they run lib/build.nix's
+#      `mkQuadletUnitPackage` against well-formed rendered containers for real, then grep the
+#      generated `.service` for the exact lines that prove the mechanism (a real
+#      `ExecStart=.../podman run`, `Type=notify`, `NotifyAccess=all`, the `Pod=` reference
+#      resolved to a literal `BindsTo=`, the healthcheck flag, the pod's reverse `Wants=`; and,
+#      for the second, a redirected podman path plus the flags a `Type=oneshot` unit must have
+#      LOST). The facts they assert are properties of the generator binary, not of any Nix code
+#      here, so an eval-time check could not reach them. The first's own comment explains why it
+#      does NOT
 #      also re-run `systemd-analyze verify` (the Nix build sandbox has no writable `/run`, which
 #      that command hardcodes) -- the claim itself was checked directly, empirically, before this
 #      repo's first commit; see docs/gotchas.md for the transcript. This check IS required to
@@ -119,6 +123,38 @@ let
     };
   };
 
+  oneshotIllegalRestart = {
+    nixpods.containers.example = {
+      image = { repository = "docker.io/library/nginx"; inherit digest; };
+      oneshot = true;
+      restart.policy = "always";
+    };
+  };
+
+  oneshotLegalRestart = {
+    nixpods.containers.example = {
+      image = { repository = "docker.io/library/nginx"; inherit digest; };
+      oneshot = true;
+      restart.policy = "no";
+    };
+  };
+
+  # ── the appliance: values only, exactly what a host is expected to have to say ──────────
+  ripperHost = {
+    nixpods.ripper = {
+      enable = true;
+      outputDir = "/srv/rips";
+      image.digest = digest;
+    };
+  };
+
+  ripperUnpinned = {
+    nixpods.ripper = {
+      enable = true;
+      outputDir = "/srv/rips";
+    };
+  };
+
   results = [
     # --- a fully-pinned container composes -------------------------------------------
     (check "pinned-container/toplevel-evaluates"
@@ -179,6 +215,69 @@ let
         in svc.overrideStrategy == "asDropin" && svc.wantedBy == [ "multi-user.target" ]
       )
       "systemd.services.example: ${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example}")
+
+    # --- oneshot x restart policy: systemd refuses to LOAD the combination, so we refuse to
+    #     build it (systemd's own whitelist, verified with systemd-analyze -- docs/gotchas.md)
+    (check "oneshot-restart-always/fails-evaluation"
+      (buildFails oneshotIllegalRestart)
+      "expected oneshot = true with restart.policy = \"always\" (a combination systemd refuses to load) to fail evaluation, but it succeeded")
+
+    (check "oneshot-restart-no/succeeds"
+      (evalOk oneshotLegalRestart)
+      "expected oneshot = true with restart.policy = \"no\" to evaluate cleanly")
+
+    (check "oneshot/renders-type-oneshot-into-the-quadlet-text"
+      (lib.hasInfix "Type=oneshot" (evalNixos oneshotLegalRestart).nixpods.containers.example.text)
+      "text: ${(evalNixos oneshotLegalRestart).nixpods.containers.example.text}")
+
+    # --- the ripper appliance renders into a container, values-only from the host's side ---
+    (check "ripper/host-declaring-values-only-evaluates"
+      (evalOk ripperHost)
+      "expected nixpods.ripper with enable + outputDir + a pinned digest to evaluate cleanly")
+
+    (check "ripper/inherits-the-repo-digest-assertion"
+      (buildFails ripperUnpinned)
+      "expected an unpinned nixpods.ripper image to fail evaluation through modules/containers.nix's own digest assertion -- an appliance must not be able to opt itself out of image pinning")
+
+    (check "ripper/is-an-on-demand-job-on-all-three-counts"
+      (
+        let c = (evalNixos ripperHost).nixpods.containers.ripper;
+        in c.oneshot && c.wantedBy == [ ] && !c.restartIfChanged && c.restart.policy == "no"
+      )
+      "ripper container: oneshot=${builtins.toJSON (evalNixos ripperHost).nixpods.containers.ripper.oneshot}, wantedBy=${builtins.toJSON (evalNixos ripperHost).nixpods.containers.ripper.wantedBy}, restartIfChanged=${builtins.toJSON (evalNixos ripperHost).nixpods.containers.ripper.restartIfChanged}")
+
+    (check "ripper/renders-drive-mounts-and-image-contract"
+      (
+        let text = (evalNixos ripperHost).nixpods.containers.ripper.text;
+        in lib.hasInfix "AddDevice=/dev/sr0:/dev/sr0" text
+          && lib.hasInfix "Volume=/srv/rips:/out" text
+          && lib.hasInfix "Volume=/var/lib/ripper:/config" text
+          && lib.hasInfix "GroupAdd=cdrom" text
+          && lib.hasInfix "PodmanArgs=--privileged" text
+          && lib.hasInfix "Image=docker.io/rix1337/docker-ripper:manual-latest@${digest}" text
+      )
+      "text: ${(evalNixos ripperHost).nixpods.containers.ripper.text}")
+
+    (check "ripper/no-timezone-set-passes-no-TZ"
+      (!(lib.hasInfix "TZ=" (evalNixos ripperHost).nixpods.containers.ripper.text))
+      "text: ${(evalNixos ripperHost).nixpods.containers.ripper.text}")
+
+    (check "ripper/creates-its-directories-owned-by-the-in-container-uid"
+      (
+        let rules = (evalNixos ripperHost).systemd.tmpfiles.rules;
+        in lib.any (r: lib.hasInfix "/srv/rips" r && lib.hasInfix "1000 1000" r) rules
+          && lib.any (r: lib.hasInfix "/var/lib/ripper" r) rules
+      )
+      "tmpfiles.rules: ${builtins.toJSON (evalNixos ripperHost).systemd.tmpfiles.rules}")
+
+    (check "ripper/restartIfChanged-false-reaches-the-real-systemd-option"
+      (!(evalNixos ripperHost).systemd.services.ripper.restartIfChanged)
+      "systemd.services.ripper.restartIfChanged: ${builtins.toJSON (evalNixos ripperHost).systemd.services.ripper.restartIfChanged}")
+
+    # --- on the NixOS plane the generated unit names this host's own podman ---------------
+    (check "nixos-plane/podman-path-defaults-to-null"
+      ((evalNixos pinnedContainer).nixpods.podman.path == null)
+      "nixpods.podman.path: ${builtins.toJSON (evalNixos pinnedContainer).nixpods.podman.path}")
   ];
 
   # ── Pure render-time checks: no nixosSystem at all -------------------------------
@@ -192,7 +291,9 @@ let
     network = null;
     environment = { };
     volumes = [ ];
+    devices = [ ];
     ports = [ ];
+    oneshot = false;
     waitForNetworkOnline = true;
     health = { cmd = null; interval = "30s"; timeout = "5s"; retries = 3; startPeriod = "5s"; };
     restart = { policy = "on-failure"; restartSec = 5; startLimitBurst = 3; startLimitIntervalSec = 600; };
@@ -255,6 +356,17 @@ let
       )
       "rendered: ${render.renderContainer "example" (baseContainerCfg // { volumes = [ "/a:/a" "/b:/b" ]; ports = [ "80:80" "443:443" ]; })}")
 
+    (check "render/devices-become-repeatable-adddevice-lines"
+      (
+        let text = render.renderContainer "example" (baseContainerCfg // { devices = [ "/dev/sr0:/dev/sr0" "/dev/dri:/dev/dri" ]; });
+        in lib.hasInfix "AddDevice=/dev/sr0:/dev/sr0" text && lib.hasInfix "AddDevice=/dev/dri:/dev/dri" text
+      )
+      "rendered: ${render.renderContainer "example" (baseContainerCfg // { devices = [ "/dev/sr0:/dev/sr0" "/dev/dri:/dev/dri" ]; })}")
+
+    (check "render/oneshot-false-leaves-quadlets-own-default-unmentioned"
+      (!(lib.hasInfix "Type=" (render.renderContainer "example" baseContainerCfg)))
+      "rendered: ${render.renderContainer "example" baseContainerCfg}")
+
     (check "render/extra-container-config-escape-hatch"
       (lib.hasInfix "AddCapability=CAP_NET_ADMIN" (render.renderContainer "example" (baseContainerCfg // { extraContainerConfig.AddCapability = "CAP_NET_ADMIN"; })))
       "rendered: ${render.renderContainer "example" (baseContainerCfg // { extraContainerConfig.AddCapability = "CAP_NET_ADMIN"; })}")
@@ -279,7 +391,9 @@ let
     network = null;
     environment = { EXAMPLE_VAR = "1"; };
     volumes = [ "/srv/example/data:/data" ];
+    devices = [ ];
     ports = [ ];
+    oneshot = false;
     waitForNetworkOnline = true;
     health = { cmd = "curl -f http://localhost/health"; interval = "30s"; timeout = "5s"; retries = 3; startPeriod = "5s"; };
     restart = { policy = "on-failure"; restartSec = 5; startLimitBurst = 3; startLimitIntervalSec = 600; };
@@ -340,6 +454,54 @@ let
 
       echo "quadlet generated real units for both web.service and webpod-pod.service, with the Pod=/health/notify facts confirmed by grep against the generator's real output" > $out
     '';
+
+  # ── The second REAL build: the two facts that make the foreign-distro plane possible -------
+  # Both are properties of the generator itself, not of any Nix code in this repo, so neither can
+  # be asserted at eval time -- they only exist once the real binary has run:
+  #
+  #   1. `PODMAN=<path>` redirects the generated Exec* lines away from the store path of the
+  #      podman that did the generating. That is what lets a system-manager host point its units
+  #      at the distro's own podman instead of carrying a second copy of the CLI.
+  #   2. `Type=oneshot` is not a relabelling: the generator DROPS `-d` and `--sdnotify=conmon`
+  #      from the ExecStart it writes, which is the whole difference between a detached service
+  #      and a job whose completion `systemctl start` actually waits for.
+  foreignPodmanCheck = pkgs.runCommand "nixpods-quadlet-honours-foreign-podman-path"
+    {
+      units = build.mkQuadletUnitPackage {
+        inherit pkgs podman;
+        type = "system";
+        podmanPath = "/usr/bin/podman";
+        objects = [{
+          ref = "ripper.container";
+          serviceName = "ripper";
+          text = render.renderContainer "ripper" (baseContainerCfg // {
+            oneshot = true;
+            devices = [ "/dev/sr0:/dev/sr0" ];
+            restart = baseContainerCfg.restart // { policy = "no"; };
+          });
+        }];
+      };
+    }
+    ''
+      set -eu
+      SVC="$units/lib/systemd/system/ripper.service"
+      test -e "$SVC" || { echo "expected ripper.service to exist, it does not" >&2; exit 1; }
+
+      grep -q '^ExecStart=/usr/bin/podman run' "$SVC" || { echo "the generated ExecStart= did not honour PODMAN=/usr/bin/podman" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q '^ExecStop=/usr/bin/podman' "$SVC" || { echo "the generated ExecStop= did not honour PODMAN=/usr/bin/podman" >&2; cat "$SVC" >&2; exit 1; }
+      grep -qv '/nix/store/.*/bin/podman' "$SVC" || { echo "a store podman path survived into the unit" >&2; cat "$SVC" >&2; exit 1; }
+
+      grep -q '^Type=oneshot$' "$SVC" || { echo "Type=oneshot did not reach the generated unit" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q -- '--device /dev/sr0:/dev/sr0' "$SVC" || { echo "AddDevice= did not become --device" >&2; cat "$SVC" >&2; exit 1; }
+
+      if grep -qE -- '(--sdnotify=conmon| -d )' "$SVC"; then
+        echo "a oneshot unit kept the detached/notify flags -- systemctl start would no longer wait for the job" >&2
+        cat "$SVC" >&2
+        exit 1
+      fi
+
+      echo "the generator honoured PODMAN=/usr/bin/podman and rendered a foreground oneshot ExecStart with the device passed through" > $out
+    '';
 in
 if failed != [ ]
 then
@@ -356,4 +518,6 @@ else {
     '';
 
   quadlet-generates-real-units = realBuildCheck;
+
+  quadlet-honours-foreign-podman-path = foreignPodmanCheck;
 }

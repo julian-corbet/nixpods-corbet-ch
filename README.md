@@ -150,6 +150,90 @@ for no reason anyone could reconstruct). Health is `null` (no healthcheck) unles
 given; every other health field is inert until `cmd` is set, so "I didn't configure a
 healthcheck" and "I configured one badly" stay visibly different states.
 
+### 4. On-demand jobs are a first-class shape, not a service with the wiring removed
+
+Not everything worth declaring is a service that stays up. A job bound to hardware someone has to
+physically insert -- rip this disc -- is started by hand, runs to completion, and then is nothing
+again. Three settings say that, and leaving any one of them out is a real failure rather than an
+untidiness:
+
+```nix
+nixpods.containers.job = {
+  oneshot = true;             # foreground: `systemctl start job` waits, and reports the exit status
+  wantedBy = [ ];             # nothing pulls it in at boot
+  restartIfChanged = false;   # ...and a deploy does not count as somebody starting it
+  restart.policy = "no";
+};
+```
+
+`oneshot` is a real change to what the generator writes, not a label: it drops `-d` and
+`--sdnotify=conmon` from the ExecStart, which is the difference between `systemctl start`
+returning immediately and returning the job's own result. `restartIfChanged = false` exists
+because system-manager's activator calls `ReloadOrRestartUnit` on every unit whose definition
+changed without checking whether it is running, and `reload-or-restart` starts an inactive one --
+so without it, editing an unrelated option and redeploying starts the job. And systemd refuses to
+LOAD a `Type=oneshot` unit whose `Restart=` is `always` or `on-success`, at unit-load time on the
+host; nixpods asserts against that combination at build time instead. All three are transcripts
+in [`docs/gotchas.md`](docs/gotchas.md), not assertions.
+
+`nixpods.ripper` is the first module built out of this shape -- see "Appliances" below.
+
+## Two planes, one declaration
+
+nixpods runs on NixOS (`nixosModules.nixpods`) and on a foreign distro through
+[system-manager](https://github.com/numtide/system-manager)
+(`systemManagerModules.nixpods`). A container is declared the same way on either; there is no
+per-plane translation table and no second copy of the declaration.
+
+That is possible because the mechanism was already plane-neutral, which was confirmed by reading
+system-manager's own `nix/modules/systemd.nix` rather than assumed: its `systemd.packages`
+implementation links every `$package/lib/systemd/system/*` into `/etc/systemd/system` and turns a
+Nix-side definition of a unit a package already provided into `<unit>.d/overrides.conf` -- exactly
+what `overrideStrategy = "asDropin"` means on NixOS. `systemd.tmpfiles.rules` is there too, with
+NixOS's syntax. So the generated package and its `wantedBy` drop-in install unchanged on both.
+
+`modules/nixpods.nix` holds everything that is true on both planes. Each backend adds only what
+cannot be shared:
+
+| | NixOS (`modules/nixos.nix`) | system-manager (`modules/system-manager.nix`) |
+|---|---|---|
+| podman | `virtualisation.podman.enable`, and the generator defaults to that same package | the distro's own package; units are pointed at `nixpods.podman.path` (`/usr/bin/podman`) |
+| checking podman exists | the store path is the proof | a **pre-activation assertion** -- no build can prove a path outside the store exists, and this is the earliest honest check on that plane |
+| rootless | supported: `systemd.user.services` + the linger warning | **refused by name** -- system-manager's etc builder emits `systemd/system` and nothing else, so a rootless unit would be generated and installed nowhere |
+
+The generator that runs at build time is always a Nix package (`nixpods.podman.package`) -- there
+is no other way to translate at build time. What `nixpods.podman.path` changes is only the binary
+the generated `ExecStart=` names, via the one extra environment variable the generator reads. A
+foreign-distro host therefore does not end up with a second podman CLI writing the same
+`/var/lib/containers` as the distro's own.
+
+## Appliances
+
+`nixpods.ripper` -- an optical-disc ripper (`rix1337/docker-ripper`) as an on-demand podman job
+bound to a physical drive. A host says only what is true about that host:
+
+```nix
+nixpods.ripper = {
+  enable = true;
+  outputDir = "/srv/rips";        # no default: a rip lands in a content tree only the host knows
+  timeZone = "America/Los_Angeles";     # optional; no timezone is invented here
+  image.digest = "sha256:...";    # or allowFloatingTag = true, out loud
+};
+```
+
+Everything else -- the image, the two mount points it expects, its `PUID`/`PGID`/`TZ` contract,
+the device passthrough, the `--privileged` its rip tools' raw SG_IO ioctls need, and the
+run-to-completion unit shape -- is mechanism, identical on every host that ever wants the job, and
+lives in `modules/ripper.nix`. It renders into `nixpods.containers.<name>` like any other caller,
+which means it inherits this repo's own digest assertion: an appliance cannot quietly float its
+own image.
+
+Why an appliance belongs in a translator repo at all: the README's own Boundaries section says
+nixpods is for workloads that are single-host BY NATURE -- real local state, a hardware
+dependency, an identity welded to one machine. A drive on one desk is that statement in its purest
+form. Left in a private host config, "how do you rip a disc with this image" gets retyped per host
+and per plane, and the copies drift.
+
 ## Boundaries
 
 **vs. k3s** -- k3s is the default for services here. nixpods is for workloads that are
@@ -183,7 +267,7 @@ container that needs neither.
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        nixpods.nixosModules.default
+        nixpods.nixosModules.default   # or nixpods.systemManagerModules.default
         {
           nixpods.containers.web = {
             image = {
@@ -206,34 +290,44 @@ container that needs neither.
 
 | Path | Purpose |
 |---|---|
-| `flake.nix` | Flake entry point: `nixosModules.nixpods` / `.default`, the pure `lib.*`, `checks`, and the deliberately-failing demo `packages` output. |
+| `flake.nix` | Flake entry point: `nixosModules.nixpods` / `systemManagerModules.nixpods` / `.default`, the pure `lib.*`, `checks`, and the deliberately-failing demo `packages` output. |
 | `modules/containers.nix` | `nixpods.containers.<name>` -- the main policy-bearing option surface. |
 | `modules/pods.nix` / `networks.nix` / `volumes.nix` | The other three Quadlet kinds, deliberately thin. |
-| `modules/default.nix` | The wiring: collects every declared object, runs the real generator, installs via `systemd.packages`. |
+| `modules/nixpods.nix` | The wiring that is true on every plane: collects every declared object, runs the real generator, installs via `systemd.packages`. |
+| `modules/nixos.nix` / `modules/system-manager.nix` | The two thin per-plane backends; each header says exactly what it adds and why that part could not be shared. |
+| `modules/ripper.nix` | `nixpods.ripper` -- the first appliance: an optical-disc ripper as an on-demand job. |
 | `lib/build.nix` | The vendored `mkQuadletUnitPackage` -- see its own header for the full credit and reasoning. |
 | `lib/render.nix` | The pure typed-option -> Quadlet-INI translation table. |
-| `lib/options.nix` | Option fragments shared by all four kinds (root/rootless, restart, escape hatches). |
+| `lib/options.nix` | Option fragments shared by all four kinds and by appliances (image pinning, root/rootless, restart, escape hatches). |
 | `docs/gotchas.md` | The empirical findings this design is built on -- transcripts, not assertions. |
-| `checks/default.nix` | Eval-time + one real-build check; see its own header for the split. |
+| `checks/default.nix` | Eval-time + two real-build checks; see its own header for the split. |
+| `checks/system-manager-eval-tests.nix` | The other plane, evaluated for real through system-manager's own `makeSystemConfig` -- and its generated unit built and read back. |
 | `checks/demo-malformed-fails-build.nix` | The negative proof: `nix build .#demo-malformed-container-fails-build` is SUPPOSED to fail. |
 | `experiments/` | Open judgment calls, not yet settled -- see [`experiments/README.md`](experiments/README.md). |
 | `studies/` | Written-up findings that changed a decision -- see [`studies/README.md`](studies/README.md). |
 
 ## Status
 
-First cut. The mechanism (`lib/build.nix`) and the full policy layer (image pinning, root/rootless
-default, health/restart conventions) are implemented and covered by `nix flake check` -- both the
-eval-time assertions (an unpinned image, a dangling `Pod=` reference, a container/pod name
-collision, all fail evaluation by name) and one real, non-eval build that runs the actual
-generator and greps its output for the exact facts that prove the mechanism (real `ExecStart=`,
-`Type=notify`, `NotifyAccess=all`, `Pod=` resolved to a literal `BindsTo=`, the healthcheck flag).
-`systemd-analyze verify` was run against this exact mechanism too, empirically, once, live,
-outside the Nix build sandbox (which has no writable `/run` for it to use) -- see
+The mechanism (`lib/build.nix`), the full policy layer (image pinning, root/rootless default,
+health/restart conventions, the on-demand job shape), both planes, and one appliance are
+implemented and covered by `nix flake check`:
+
+- eval-time assertions, on both planes -- an unpinned image, a dangling `Pod=` reference, a
+  container/pod name collision, a `Type=oneshot` unit with a `Restart=` systemd would refuse to
+  load, a rootless object on a plane with no user unit tree: each fails evaluation by name;
+- three real, non-eval builds that run the actual generator and grep its output for the facts
+  that prove the mechanism -- real `ExecStart=`, `Type=notify`, `NotifyAccess=all`, `Pod=`
+  resolved to a literal `BindsTo=`, the healthcheck flag; a foreground `Type=oneshot` ExecStart
+  with `-d`/`--sdnotify` gone and the device passed through; and the system-manager plane's own
+  generated unit, built through system-manager's `makeSystemConfig` and read back, calling
+  `/usr/bin/podman`.
+
+`systemd-analyze verify` was run against this exact mechanism empirically, live, outside the Nix
+build sandbox (which has no writable `/run` for it to use) -- see
 [`docs/gotchas.md`](docs/gotchas.md) for that transcript; it is not re-invoked by `nix flake
 check` itself, and `checks/default.nix`'s own comment says why. Not yet done, deliberately:
 `.build`/`.image`/`.kube`/`.artifact` Quadlet kinds (see `experiments/README.md`'s open question
-003 for why, and the most likely next one to actually earn its own module). Nothing here has yet
-run a real workload on a live host; that is the next step, not this one.
+003 for why, and the most likely next one to actually earn its own module).
 
 ## License
 

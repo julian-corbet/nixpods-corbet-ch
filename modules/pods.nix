@@ -42,6 +42,8 @@ let
 
       restart = opts.restartOption;
 
+      restartIfChanged = opts.restartIfChangedOption;
+
       wantedBy = opts.wantedByOption [ "multi-user.target" ];
 
       extraUnitConfig = opts.extraSectionOption "Escape hatch into this unit's [Unit] section for keys not modeled above.";
