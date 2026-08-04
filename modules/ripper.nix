@@ -18,7 +18,7 @@
 # invocation drift silently -- two that agree on every option NAME can still disagree about
 # whether the unit waits for the rip to finish.
 #
-# THE ESTATE-SPECIFIC PART STAYS OUT. Where the rips land (`outputDir`), which device node the
+# THE HOST-SPECIFIC PART STAYS OUT. Where the rips land (`outputDir`), which device node the
 # drive enumerates as, which uid/gid owns the files, which timezone stamps the logs: values, no
 # defaults invented here beyond what is a genuine convention rather than somebody's choice.
 #
