@@ -30,7 +30,7 @@
 #      `packages.<system>` output, not a `checks` one) for the matching NEGATIVE proof: a
 #      malformed container fed through the exact same mechanism, left buildable on purpose so it
 #      can be watched fail.
-{ pkgs, lib, system, nixpodsModule }:
+{ pkgs, lib, system, nixpodsModule, packagesModule }:
 
 let
   render = import ../lib/render.nix { inherit lib; };
@@ -67,6 +67,24 @@ let
 
   evalOk = extraConfig: (evalToplevel extraConfig).success;
   buildFails = extraConfig: !(evalToplevel extraConfig).success;
+
+  # ── nixpods.packages -- a SEPARATE opt-in module (modules/packages.nixos.nix), not pulled in by
+  # nixpodsModule, so it needs its own composition rather than reusing evalNixos/evalToplevel
+  # above. Same proof nixiam's own checks/default.nix runs for its packages module: the baseline
+  # resolves on NixOS, and an unresolvable override fails the build by name.
+  evalNixosPackages = extraConfig:
+    (lib.nixosSystem {
+      inherit system;
+      modules = [ packagesModule extraConfig bootStub ];
+    }).config;
+
+  packagesEvalToplevel = extraConfig:
+    builtins.tryEval (builtins.seq
+      (builtins.unsafeDiscardStringContext (evalNixosPackages extraConfig).system.build.toplevel.drvPath)
+      true);
+
+  packagesEvalOk = extraConfig: (packagesEvalToplevel extraConfig).success;
+  packagesBuildFails = extraConfig: !(packagesEvalToplevel extraConfig).success;
 
   # ── Fixtures ─────────────────────────────────────────────────────────────────────
   pinnedContainer = {
@@ -153,6 +171,10 @@ let
       enable = true;
       outputDir = "/srv/rips";
     };
+  };
+
+  packagesBaselineMissing = {
+    nixpods.packages.baseline = [ "podman-compose" "definitely-does-not-exist-in-nixpkgs" ];
   };
 
   results = [
@@ -280,6 +302,26 @@ let
       "nixpods.podman.path: ${builtins.toJSON (evalNixos pinnedContainer).nixpods.podman.path}")
   ];
 
+  # ── nixpods.packages -- the declared host tooling exception, proven the same way nixiam
+  # proves its own baseline: resolves cleanly by default, fails by name when it cannot ─────────
+  packageResults = [
+    (check "packages/default-baseline-builds-on-nixos"
+      (packagesEvalOk { })
+      "nixpods packages baseline must resolve on NixOS without failing the build")
+
+    (check "packages/baseline-names-podman-compose"
+      ((evalNixosPackages { }).nixpods.packages.baseline == [ "podman-compose" ])
+      "nixpods.packages.baseline: ${builtins.toJSON (evalNixosPackages { }).nixpods.packages.baseline}")
+
+    (check "packages/podman-compose-reaches-environment-systemPackages"
+      (lib.any (p: (p.pname or p.name) == "podman-compose") (evalNixosPackages { }).environment.systemPackages)
+      "environment.systemPackages: ${builtins.toJSON (map (p: p.pname or p.name) (evalNixosPackages { }).environment.systemPackages)}")
+
+    (check "packages/unresolvable-entry-fails-on-nixos"
+      (packagesBuildFails packagesBaselineMissing)
+      "a baseline override that names a non-existent nixpkgs package must fail on NixOS")
+  ];
+
   # ── Pure render-time checks: no nixosSystem at all -------------------------------
   baseContainerCfg = {
     image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
@@ -372,7 +414,7 @@ let
       "rendered: ${render.renderContainer "example" (baseContainerCfg // { extraContainerConfig.AddCapability = "CAP_NET_ADMIN"; })}")
   ];
 
-  allResults = results ++ renderResults;
+  allResults = results ++ renderResults ++ packageResults;
   failed = builtins.filter (r: !r.ok) allResults;
   report = lib.concatMapStringsSep "\n" (r: "  - ${r.name}: ${r.detail}") failed;
 

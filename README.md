@@ -313,6 +313,7 @@ container that needs neither.
 | `modules/pods.nix` / `networks.nix` / `volumes.nix` | The other three Quadlet kinds, deliberately thin. |
 | `modules/nixpods.nix` | The wiring that is true on every plane: collects every declared object, runs the real generator, installs via `systemd.packages`. |
 | `modules/nixos.nix` / `modules/system-manager.nix` | The two thin per-plane backends; each header says exactly what it adds and why that part could not be shared. |
+| `modules/packages.nix` / `packages.arch.nix` / `packages.nixos.nix` | `nixpods.packages` -- the one declared-tooling exception (`podman-compose`), opt-in and separate from the plane-neutral wiring above. |
 | `modules/ripper.nix` | `nixpods.ripper` -- the first appliance: an optical-disc ripper as an on-demand job. |
 | `lib/build.nix` | The vendored `mkQuadletUnitPackage` -- see its own header for the full credit and reasoning. |
 | `lib/render.nix` | The pure typed-option -> Quadlet-INI translation table. |

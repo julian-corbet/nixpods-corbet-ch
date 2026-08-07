@@ -29,6 +29,13 @@
       systemManagerModules.nixpods = ./modules/system-manager.nix;
       systemManagerModules.default = self.systemManagerModules.nixpods;
 
+      # nixpods.packages -- declared host tooling (podman-compose), NOT part of the plane-neutral
+      # wiring above and not pulled in by nixosModules.nixpods/systemManagerModules.nixpods on its
+      # own. A separate opt-in module, same shape as nixiam's own packages.nix/.arch.nix/.nixos.nix
+      # trio -- see modules/packages.nix's header for why this repo declares packages at all.
+      systemManagerModules.packages = ./modules/packages.arch.nix;
+      nixosModules.packages = ./modules/packages.nixos.nix;
+
       # The pure pieces, exposed for inspection or reuse without a NixOS evaluation -- same
       # reasoning as nixvm exposing `lib.mkDomainXML` and nixfs exposing its catalogue.
       lib = {
@@ -43,6 +50,7 @@
             pkgs = nixpkgs.legacyPackages.${system};
             inherit lib system;
             nixpodsModule = self.nixosModules.nixpods;
+            packagesModule = self.nixosModules.packages;
           }
         // {
           system-manager-eval-tests = import ./checks/system-manager-eval-tests.nix {
