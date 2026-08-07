@@ -199,13 +199,31 @@ cannot be shared:
 |---|---|---|
 | podman | `virtualisation.podman.enable`, and the generator defaults to that same package | the distro's own package; units are pointed at `nixpods.podman.path` (`/usr/bin/podman`) |
 | checking podman exists | the store path is the proof | a **pre-activation assertion** -- no build can prove a path outside the store exists, and this is the earliest honest check on that plane |
+| checking it is the *right* podman | the two are one package; nothing to compare | a **second pre-activation assertion**: the generating and running podmans must agree on a major version, or the deploy is refused by name |
 | rootless | supported: `systemd.user.services` + the linger warning | **refused by name** -- system-manager's etc builder emits `systemd/system` and nothing else, so a rootless unit would be generated and installed nowhere |
+| `wantedBy = [ "multi-user.target" ]` | lands in `multi-user.target.wants/` | rewritten by system-manager's own `substituteTarget` to `system-manager.target.wants/` -- same declaration, different directory; see [`docs/gotchas.md`](docs/gotchas.md) |
 
 The generator that runs at build time is always a Nix package (`nixpods.podman.package`) -- there
 is no other way to translate at build time. What `nixpods.podman.path` changes is only the binary
 the generated `ExecStart=` names, via the one extra environment variable the generator reads. A
 foreign-distro host therefore does not end up with a second podman CLI writing the same
 `/var/lib/containers` as the distro's own.
+
+### The version skew that advice alone did not close
+
+Because those are two different binaries, and the FLAGS in a generated `ExecStart=` are the
+vocabulary of whichever podman wrote them, a foreign-distro host is asking one podman to execute
+another's command line. That is not a hypothetical gap: nixpkgs-unstable currently ships podman
+**5.8.4** while the Arch host this repo deploys to ships podman **6.0.2** -- a major-version
+boundary, in the direction where a moved flag fails at container start, on the host, after a build
+that succeeded.
+
+`nixpods.podman.requireMatchingMajor` (default `true`) refuses that deploy by name. It rides the
+pre-activation hook rather than an assertion for the same reason the `-x` check does: the target's
+podman version is not knowable at build time. Set it `false` to cross that boundary knowingly --
+the report still prints on every deploy, exactly like `allowFloatingTag`'s warning, so a host that
+took the shortcut never looks like one that did not. [`docs/gotchas.md`](docs/gotchas.md) has the
+transcript of all four branches exercised against `/bin/sh`.
 
 ## Appliances
 
@@ -315,6 +333,11 @@ implemented and covered by `nix flake check`:
 - eval-time assertions, on both planes -- an unpinned image, a dangling `Pod=` reference, a
   container/pod name collision, a `Type=oneshot` unit with a `Restart=` systemd would refuse to
   load, a rootless object on a plane with no user unit tree: each fails evaluation by name;
+- the two pre-activation checks the foreign-distro plane needs, asserted for their content rather
+  than merely for their presence: podman exists at the path the units name, and the generating and
+  running podmans agree on a major version -- including that the opt-out keeps the report and drops
+  only the refusal, and that the script uses shell built-ins alone (no awk/sed/grep, none of which
+  this config may assume on a distro it does not own);
 - three real, non-eval builds that run the actual generator and grep its output for the facts
   that prove the mechanism -- real `ExecStart=`, `Type=notify`, `NotifyAccess=all`, `Pod=`
   resolved to a literal `BindsTo=`, the healthcheck flag; a foreground `Type=oneshot` ExecStart

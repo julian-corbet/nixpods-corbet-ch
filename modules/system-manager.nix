@@ -26,6 +26,13 @@
 #      on the target before anything is switched: a host without podman fails its deploy, by
 #      name, instead of leaving a unit that will not start behind.
 #
+#      The same hook answers a second question that only this plane has: WHICH PODMAN. The flags
+#      in a generated `ExecStart=` are the vocabulary of the podman that WROTE them, and on this
+#      plane that is not the podman that runs them -- so a host generating with one major version
+#      and running another is asking one podman to execute another's command line. That is checked
+#      here too (`nixpods.podman.requireMatchingMajor`), for the same reason and at the same
+#      moment, because the target's own podman version is not knowable any earlier either.
+#
 #   3. THERE IS NO `systemd --user` TREE. system-manager's etc builder emits `systemd/system` and
 #      nothing else, so a rootless object here would be generated, installed nowhere, and never
 #      run. That is refused by name below rather than silently dropped.
@@ -35,6 +42,53 @@ let
   cfg = config.nixpods;
   enabled = cfg.build.systemUnits != null || cfg.build.userUnits != null;
   rootlessNames = lib.attrNames cfg.build.rootlessUids;
+
+  # The major version of the podman whose quadlet binary writes this host's `ExecStart=` lines.
+  # Known at build time, because that one IS a Nix package -- which is precisely why the OTHER half
+  # of the comparison has to wait for the target.
+  generatingMajor = lib.versions.major cfg.podman.package.version;
+
+  # POSIX sh only, and deliberately so: this runs inside system-manager's own pre-activation hook on
+  # a foreign distro, where nothing about the shell environment is this config's to assume. No awk,
+  # no sed, no grep -- `${var##* }` and `${var%%.*}` are shell built-ins everywhere.
+  #
+  # `podman --version` prints "podman version 6.0.2": the format string is `%s version %s`, read
+  # out of the podman binary itself rather than remembered. If it ever stops being that, the parse
+  # falls through to the "could not read a version" branch below, which reports and does NOT block
+  # -- a deploy must not fail because a diagnostic changed shape.
+  versionCheckScript = ''
+    running_raw=$("${cfg.podman.path}" --version 2>/dev/null || true)
+    running_version=''${running_raw##* }
+    running_major=''${running_version%%.*}
+
+    case "$running_major" in
+      ""|*[!0-9]*)
+        echo "nixpods: could not read a version out of \`${cfg.podman.path} --version\` (got: \"$running_raw\")."
+        echo "The generator/runtime major-version check is being skipped rather than blocking this"
+        echo "deploy on a parse failure. This host generates its units with podman ${generatingMajor}.x;"
+        echo "confirm by hand that ${cfg.podman.path} is on the same major version."
+        ;;
+      "${generatingMajor}")
+        ;;
+      *)
+        echo "nixpods: this host GENERATES its units with podman ${generatingMajor}.x"
+        echo "(nixpods.podman.package = ${cfg.podman.package.name}) and RUNS them with podman"
+        echo "$running_version (${cfg.podman.path})."
+        echo ""
+        echo "Those are different major versions. Every generated ExecStart= line was written in the"
+        echo "GENERATING podman's flag vocabulary, because that is the binary that wrote it -- so"
+        echo "activating would install units that ask podman $running_major to execute podman"
+        echo "${generatingMajor}'s command line. A flag that moved between the two fails at container"
+        echo "start, on this host, after a build that succeeded."
+        echo ""
+        echo "Either align the two -- pin nixpods.podman.package to the major version this distro"
+        echo "ships, or update the distro's podman -- or, if this skew is understood and accepted,"
+        echo "set nixpods.podman.requireMatchingMajor = false, which keeps this report and drops the"
+        echo "refusal."
+        ${lib.optionalString cfg.podman.requireMatchingMajor "exit 1"}
+        ;;
+    esac
+  '';
 in
 {
   imports = [ ./nixpods.nix ];
@@ -60,6 +114,15 @@ in
             exit 1
           fi
         '';
+      };
+
+      # A SEPARATE assertion rather than more lines in the one above, on purpose: "podman is not
+      # installed" and "podman is a different major version than the one that wrote these units" are
+      # two distinct findings with two distinct fixes, and a host reading a failed deploy should be
+      # told which one it hit without having to parse a combined script's output.
+      system-manager.preActivationAssertions.nixpods-podman-version = {
+        enable = true;
+        script = versionCheckScript;
       };
 
       assertions = [

@@ -55,6 +55,14 @@ let
     };
   };
 
+  # A host that has looked at the skew and accepted it: the report stays, the refusal goes.
+  skewAccepted = {
+    nixpods.podman.requireMatchingMajor = false;
+    nixpods.containers.web = {
+      image = { repository = "docker.io/library/nginx"; inherit digest; };
+    };
+  };
+
   # Rootless has nowhere to go on this plane -- system-manager's etc builder emits
   # `systemd/system` and nothing else, so the unit would be generated and installed nowhere.
   rootlessHost = {
@@ -96,6 +104,43 @@ let
         in a.enable && lib.hasInfix "/usr/bin/podman" a.script
       )
       "preActivationAssertions.nixpods-podman: ${builtins.toJSON plain.system-manager.preActivationAssertions.nixpods-podman}")
+
+    # ── generator/runtime major-version skew: the OTHER thing only this plane can get wrong ──
+    # The generating podman is a Nix package, so its major version is known here; the running one
+    # is the distro's, so it is not. That asymmetry is the whole reason this check lives in a
+    # pre-activation hook rather than in an assertion.
+    (check "system-manager/version-skew-check-is-registered-with-both-halves-of-the-comparison"
+      (
+        let
+          a = plain.system-manager.preActivationAssertions.nixpods-podman-version;
+          generatingMajor = lib.versions.major plain.nixpods.podman.package.version;
+        in a.enable
+          && lib.hasInfix "/usr/bin/podman --version" a.script
+          && lib.hasInfix ''"${generatingMajor}")'' a.script
+      )
+      "preActivationAssertions.nixpods-podman-version.script: ${plain.system-manager.preActivationAssertions.nixpods-podman-version.script}")
+
+    (check "system-manager/version-skew-refuses-the-deploy-by-default"
+      (lib.hasInfix "exit 1" plain.system-manager.preActivationAssertions.nixpods-podman-version.script)
+      "script: ${plain.system-manager.preActivationAssertions.nixpods-podman-version.script}")
+
+    # The opt-out drops the REFUSAL and keeps the REPORT -- the same shape as allowFloatingTag,
+    # where taking the shortcut never makes the host indistinguishable from one that did not.
+    (check "system-manager/version-skew-opt-out-keeps-the-report-and-drops-the-refusal"
+      (
+        let s = (evalFor skewAccepted).system-manager.preActivationAssertions.nixpods-podman-version.script;
+        in !(lib.hasInfix "exit 1" s) && lib.hasInfix "different major versions" s
+      )
+      "script: ${(evalFor skewAccepted).system-manager.preActivationAssertions.nixpods-podman-version.script}")
+
+    # It must be POSIX sh, not bash: this runs inside system-manager's own hook on a foreign
+    # distro, where the shell is not this config's to assume.
+    (check "system-manager/version-check-uses-only-shell-builtins"
+      (
+        let s = plain.system-manager.preActivationAssertions.nixpods-podman-version.script;
+        in !(lib.hasInfix "awk" s) && !(lib.hasInfix "sed " s) && !(lib.hasInfix "grep " s)
+      )
+      "script: ${plain.system-manager.preActivationAssertions.nixpods-podman-version.script}")
 
     (check "system-manager/rootless-is-refused-by-name-not-silently-dropped"
       (evalFails rootlessHost)

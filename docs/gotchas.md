@@ -146,7 +146,35 @@ Two things genuinely do NOT cross:
   so a rootless object would be generated correctly and installed nowhere. `modules/system-manager.nix`
   refuses it by name instead.
 - **`virtualisation.*` does not exist.** Podman on a foreign distro is the distro's package, which
-  is what `nixpods.podman.path` and the pre-activation assertion around it are for.
+  is what `nixpods.podman.path` and the pre-activation assertions around it are for.
+
+## `wantedBy = [ "multi-user.target" ]` does not land in `multi-user.target.wants` on system-manager
+
+One more thing that crosses, but not unchanged. From the same `nix/modules/systemd.nix`:
+
+```nix
+substituteTarget = target:
+  if target == "multi-user.target" || target == "timers.target"
+  then "system-manager.target"
+  else target;
+```
+
+...applied when it emits the enable symlink:
+
+```sh
+mkdir -p $out/'${substituteTarget target}.wants'
+ln -sfn '../${name}' $out/'${substituteTarget target}.wants'/
+```
+
+So `wantedBy = [ "multi-user.target" ]` -- the default for a container and a pod here -- is the
+correct spelling on both planes and produces a symlink in a differently-named directory on each.
+On a system-manager host the enable link is at
+`/etc/systemd/system/system-manager.target.wants/<name>.service`, and it will not be found by
+looking in `multi-user.target.wants/`. (`system-manager.target` is itself `wantedBy =
+[ "default.target" ]`, so the unit still comes up at boot; only the location of the link differs.)
+
+Nothing in nixpods needed changing for this -- it is recorded because a host debugging "did my
+container actually get enabled" on that plane will otherwise look in the wrong directory first.
 
 ## The generated `ExecStart=` binary is redirectable with one environment variable
 
@@ -165,6 +193,50 @@ Byte-identical output apart from the three `Exec*=` lines (`ExecStart`, `ExecSto
 podman at build time and still run the distro's own podman at run time, instead of carrying a
 second copy of the CLI over one shared `/var/lib/containers`. The FLAGS in that ExecStart are
 still the generating podman's vocabulary, so the two want to stay on the same major version.
+
+## ...and on a real foreign-distro host, they are NOT on the same major version
+
+That last sentence was advice for as long as nothing checked it. What the two versions actually
+are, on the host this repo is deployed to:
+
+```
+$ nix eval --raw --impure --expr '(import <pinned nixpkgs> {}).podman.version'
+5.8.4
+
+$ pacman -Q podman
+podman 6.0.2-3.1
+```
+
+So a deploy would generate an `ExecStart=` in podman 5.8.4's flag vocabulary and hand it to podman
+6.0.2 to execute. That is exactly the "silently did less than we asked" shape this repo exists to
+catch, arriving at container-start time on the host after a build that succeeded.
+
+`nixpods.podman.requireMatchingMajor` (default `true`) closes it, in the only place it can be
+closed: the target's own podman version is not knowable at build time any more than its existence
+is, so this rides the same system-manager pre-activation hook as the `-x` check. The comparison is
+POSIX sh built-ins only -- no awk, no sed, no grep, none of which this config may assume on a
+foreign distro:
+
+```sh
+running_raw=$("/usr/bin/podman" --version 2>/dev/null || true)
+running_version=${running_raw##* }
+running_major=${running_version%%.*}
+```
+
+`podman --version` prints `podman version 6.0.2`; the format string is `%s version %s`, read out of
+the podman binary rather than remembered. All four branches were exercised against `/bin/sh` with a
+stub standing in for podman:
+
+| stub prints | result |
+|---|---|
+| `podman version 6.0.2` (generator on 5.x) | full diagnostic naming both versions, `exit 1` |
+| `podman version 5.8.4` | silent, `exit 0` |
+| something with no version in it | reports that it could not parse, `exit 0` -- a deploy must not fail because a diagnostic changed shape |
+| nothing (binary exits 3) | same "could not read a version" branch, `exit 0` |
+
+Setting `requireMatchingMajor = false` drops the `exit 1` and keeps every line of the report, which
+is the same shape `allowFloatingTag` has: a host that took the shortcut is never quietly
+indistinguishable from one that did not.
 
 ## `Type=oneshot` is a real translation change, not a relabelling -- and `Type=` is the one `[Service]` key quadlet validates
 

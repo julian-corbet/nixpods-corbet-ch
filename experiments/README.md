@@ -67,3 +67,26 @@ in a v1 policy layer.
 `.image` (a plain "pre-pull and pin this image with no container using it yet" unit), which is
 the most plausible of the three to eventually earn a `nixpods.images.<name>` module using the
 exact same `image.{repository,tag,digest,allowFloatingTag}` submodule containers already have.
+
+## 004 -- is the MAJOR version the right granularity for the generator/runtime skew check?
+
+**Question:** `nixpods.podman.requireMatchingMajor` refuses a deploy when the podman that generated
+a host's units and the podman that will run them differ in major version. Major is a proxy for the
+thing actually at stake, which is whether any flag the generator wrote has moved. Two podman
+minors can also disagree about a flag; two majors very often do not.
+
+**Reasoning as it stands:** major is the granularity upstream's own compatibility promise is made
+at, so it is the only line that can be drawn without this repo inventing a compatibility table it
+would then have to maintain per podman release. Requiring an exact version match instead would fail
+every deploy on a host whose distro is one patch ahead of nixpkgs, which is nearly all of them --
+a check that fires constantly is a check that gets turned off.
+
+**What would settle it:** an actual instance of a flag that moved between two podman versions
+sharing a major, found in podman's own changelog or by a host hitting it. That would turn this from
+a proxy into a real comparison -- most likely by diffing the generated `ExecStart=` produced by two
+podman packages against the same input, which is a check this repo could run at BUILD time and does
+not yet.
+
+**Live starting point:** nixpkgs-unstable ships podman 5.8.4; the Arch host this repo deploys to
+ships 6.0.2. The check currently refuses that pairing, which is the correct outcome and also means
+the first real deployment has to resolve it rather than discover it. See `docs/gotchas.md`.

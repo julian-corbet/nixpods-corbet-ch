@@ -142,6 +142,32 @@ in
         path can honestly be checked at all.
       '';
     };
+
+    requireMatchingMajor = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether a deploy is refused when the podman that GENERATED this host's units and the podman
+        that will RUN them are on different major versions.
+
+        THE HAZARD THIS CLOSES, WHICH IS NOT HYPOTHETICAL. `package` and `path` are two different
+        binaries whenever a foreign distro owns podman -- and the flags in the `ExecStart=` line
+        come from the generating podman's vocabulary, because that is the binary that wrote them.
+        A host generating with nixpkgs' podman 5.x and running the distro's podman 6.x is asking
+        one major version to execute another's command line. That is exactly the gap this repo
+        exists to catch, and until this option existed the README merely ADVISED keeping the two
+        aligned while nothing checked it.
+
+        Nothing at build time can know the target's podman version, so this is enforced where
+        `path` itself is: system-manager's pre-activation assertion, on the target, before anything
+        is switched. It is inert on a plane where `path` is `null` (NixOS), because there the two
+        are one package and there is nothing to compare.
+
+        Set `false` to deploy across a major-version boundary knowingly. The check still runs and
+        still prints what it found on every deploy -- the same shape as `allowFloatingTag`, where
+        the shortcut stays visible rather than becoming silent.
+      '';
+    };
   };
 
   # ── computed, read-only: what the per-plane backends next to this file install ─────────────
